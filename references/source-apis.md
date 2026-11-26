@@ -4,11 +4,12 @@
 
 | 源 | 角色 | 覆盖 | 缺点 |
 |---|---|---|---|
-| **OpenAlex** | 主力 | 全学科、2.5 亿+ 作品、自带被引数与引文关系 | 最新预印本收录有延迟；免费额度按 IP 共享 |
-| **arXiv** | 前沿补充 | 物理、数学、CS、生医预印本 | 只覆盖预印本，无被引数，无同行评审信息 |
-| **Crossref** | 不使用 | 本项目限定只用 OpenAlex + arXiv | 不接入，避免越界 |
+| **OpenAlex** | 通用主力 | 全学科 2.5 亿+ 作品，自带被引数与引文关系 | 最新预印本收录延迟；免费额度按 IP 共享 |
+| **arXiv** | CS/物理前沿补充 | 预印本，提交当天可检索 | 无被引数、无同行评审 |
+| **PubMed** | 医学主力 | MEDLINE 期刊、指南、系统综述 | 无被引数、无引文关系（需 OpenAlex 补） |
+| **Crossref** | **仅 DOI 回验** | DOI 元数据核对 | 不用于文献发现 |
 
-两者组合的逻辑：OpenAlex 给广度和权威度，arXiv 补最近 6–12 个月的新东西。不要新增其他数据源。
+组合逻辑：OpenAlex 给广度和引文，arXiv 补最新预印本，PubMed 补医学权威记录，Crossref 只做回验。不要新增其他数据源。
 
 ## OpenAlex
 
@@ -22,13 +23,13 @@ GET https://api.openalex.org/works
 
 | 参数 | 说明 | 本项目用法 |
 |---|---|---|
-| `search` | 全文模糊检索，最宽松 | `broad` / `core` 变体用 |
-| `filter` | 结构化过滤，精度高 | 年份、类型、字段 |
-| `sort` | 排序 | `cited_by_count:desc` 取奠基文献，`relevance_score:desc` 取相关性 |
-| `per-page` | 每页条数，上限 200 | 用 50，兼顾覆盖与成本 |
-| `select` | 只返回指定字段，显著减小响应体 | 只取需要的字段，含 `referenced_works` |
-| `mailto` | 礼貌池标识 | 取 `RESEARCH_CONTACT_EMAIL` |
-| `api_key` | 独立额度 | 取 `OPENALEX_API_KEY`，可选 |
+| `search` | 全文模糊检索 | broad / core 变体 |
+| `filter` | 结构化过滤 | 年份、类型、字段 |
+| `sort` | 排序 | 奠基层用 cited_by_count |
+| `per-page` | 每页条数，上限 200 | 50 |
+| `select` | 只返回指定字段 | 含 referenced_works |
+| `mailto` | 礼貌池标识 | `RESEARCH_CONTACT_EMAIL` |
+| `api_key` | 独立额度 | `OPENALEX_API_KEY` |
 
 ### 常用 filter
 
@@ -38,35 +39,27 @@ to_publication_date:2026-12-31
 type:article | review | preprint
 is_retracted:false
 has_doi:true
-primary_topic.field.id:fields/17          # 17 = Computer Science
+primary_topic.field.id:fields/17
 title_and_abstract.search:"graph neural network"
 ```
 
-`filter` 的多个条件用逗号连接，表示 AND。`|` 表示 OR。
-
 ### 字段映射
 
-| OpenAlex 字段 | 本项目字段 | 注意 |
+| OpenAlex | 本项目 | 注意 |
 |---|---|---|
-| `id` | `openalex_id` | 形如 `https://openalex.org/W2741809807` |
-| `doi` | `doi` | 形如 `https://doi.org/10.1021/...`，需去掉前缀只留 `10.x/...` |
-| `title` / `display_name` | `title` | 两者可能分别为空，取非空的那个 |
-| `publication_year` | `year` | 可能为 null，需兜底 |
-| `cited_by_count` | `cited_by` | 预印本常为 0 |
-| `type` | `type` | `article` / `review` / `preprint` / `book-chapter` |
-| `primary_location.source.display_name` | `venue` | 期刊/会议名，可能为 null |
-| `primary_location.landing_page_url` | `url` | 兜底用 `id` |
-| `authorships[].author.display_name` | `authors` | 只取前 8 位，避免报告臃肿 |
-| `abstract_inverted_index` | `abstract` | **倒排索引**，必须重建（见下） |
-| `referenced_works_count` | `ref_count` | 参考文献数，判断综述的一个弱信号 |
-| `referenced_works` | `referenced_works` | 被引文献的 OpenAlex ID 列表，用于集合内引文边、演化顺序与共被引；每条最多保留 300 个 |
-| `id` | `openalex_id` | 短 ID（W...），用于匹配引文边 |
-| `topics[].display_name` | `topics` | 新版字段，取 score 前 5 |
-| `concepts[].display_name` | `concepts` | 旧版字段，保留兼容；有 topics 时优先用 topics |
+| `id` | `openalex_id` | `W2741809807` |
+| `doi` | `doi` | 去掉 `https://doi.org/` 前缀 |
+| `title` / `display_name` | `title` | 取非空者 |
+| `publication_year` | `year` | 可能为 null |
+| `cited_by_count` | `cited_by` | 预印本常 0 |
+| `type` | `type` | article/review/preprint |
+| `primary_location.source.display_name` | `venue` | 可能为空 |
+| `authorships[].author.display_name` | `authors` | 只取前 8 位 |
+| `abstract_inverted_index` | `abstract` | **倒排索引，必须重建** |
+| `referenced_works` | `referenced_works` | 引文边，每条最多 300 个 |
+| `topics[].display_name` | `topics` | 取前 5 |
 
 ### 摘要重建（必做）
-
-OpenAlex 不直接给摘要文本，而是给 `{词: [位置列表]}` 的倒排索引。必须重建，否则后续所有基于摘要的判断都失效：
 
 ```python
 def rebuild(inv):
@@ -81,134 +74,152 @@ def rebuild(inv):
 
 ### 成本与限流
 
-- 单次请求成本约 **$0.001**，响应体会返回 `cost_usd` 字段
-- 无 key 时免费额度 **$0.10/天，按 IP 共享**——同一台机器上的其他程序也会消耗
-- 因此：**默认 5 次请求/次检索**（broad 1 + core 1 + review 1 + 引用排序 1 + 再补 1），并做磁盘缓存
-- 遇到 429 说明额度耗尽，**不要重试**，直接降级到 arXiv 并在 warnings 里说明
+- 无 key 时免费额度约 **$0.10/天，按 IP 共享**
+- 脚本默认固定请求数并做磁盘缓存；**同一查询不要重复运行**
+- 429 表示额度耗尽：**不要重试**，降级到 arXiv/PubMed，并在 warnings 里说明
 
 ### 降级
 
 | 情况 | 处理 |
 |---|---|
-| 429 / 额度耗尽 | 只用 arXiv 结果，报告里明确写"本次未覆盖期刊文献，建议明日重跑" |
-| 5xx / 超时 | 重试 1 次（间隔 2 秒），仍失败则降级 |
-| `results` 为空 | 不降级，回到 query-builder 调整检索式 |
+| 429 / 额度耗尽 | 只用其他源，报告写"本次未覆盖期刊文献，建议明日重跑" |
+| 5xx / 超时 | 重试 1 次（2 秒后），仍失败降级 |
+| `results` 为空 | 不降级，回 query-builder 改检索式 |
 
 ## arXiv
+
+```
+GET https://export.arxiv.org/api/query
+```
+
+| 参数 | 说明 |
+|---|---|
+| `search_query` | 支持 `all:` `ti:` `abs:` `cat:` 与 AND/OR/ANDNOT |
+| `max_results` | 上限 100，本项目 30–50 |
+| `sortBy` | relevance / submittedDate |
+| `sortOrder` | descending |
+
+解析要点：
+
+- 命名空间 Atom `http://www.w3.org/2005/Atom`，扩展 `http://arxiv.org/schemas/atom`
+- 标题/摘要常有换行，需 `" ".join(text.split())`
+- `arxiv:doi` 可能为空，用 `id`（abs 链接）兜底
+- **请求间隔至少 3 秒**
+
+## PubMed
+
+脚本用 E-utilities 两步：`esearch` 拿 PMID 列表，`efetch` 拿 XML。无需 key。
 
 ### 端点
 
 ```
-GET http://export.arxiv.org/api/query
+GET https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi
+GET https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi
 ```
 
 ### 参数
 
 | 参数 | 说明 |
 |---|---|
-| `search_query` | 支持 `all:` `ti:` `abs:` `cat:` 字段前缀与 `AND` / `OR` / `ANDNOT` |
-| `start` | 起始位置 |
-| `max_results` | 上限 100，本项目用 30–50 |
-| `sortBy` | `relevance` / `submittedDate` / `lastUpdatedDate` |
-| `sortOrder` | `descending` |
+| `db` | 固定 `pubmed` |
+| `term` | 检索式（见 query-builder） |
+| `retmax` | 每轮条数 |
+| `retmode` | esearch 用 `json`，efetch 用 `xml` |
+| `sort` | `relevance` / `pub_date` |
+| `datetype=pdat` + `mindate`/`maxdate` | 按出版日期限年 |
+| `email` / `api_key` | 可选；无 key 限速 3 次/秒 |
+| `NCBI_API_KEY` | 环境变量，有 key 可提到 10 次/秒 |
 
-例：
+脚本跑两轮：相关性一轮 + 按发表日期一轮（补最新），间隔 0.4 秒。
+
+### 字段映射
+
+| PubMed XML | 本项目 | 注意 |
+|---|---|---|
+| `MedlineCitation/PMID` | `pmid` | 无 DOI 时作 ref_key 兜底 |
+| `ArticleTitle` | `title` | 可能含 HTML 实体，需清洗 |
+| `Abstract/AbstractText` | `abstract` | 多段带 Label，拼成一段 |
+| `Journal/Title` | `venue` | 期刊全名 |
+| `AuthorList/Author` | `authors` | LastName + ForeName，前 8 位 |
+| `PubDate` | `year` / `pub_date` | 处理 MedlineDate（如 `2023 Jan-Feb`） |
+| `ArticleIdList/ArticleId[@IdType=doi]` | `doi` | 优先 DOI |
+| `ELocationID[@EIdType=doi]` | `doi` | DOI 兜底 |
+| `PublicationTypeList` | `publication_types` | 用于证据等级 |
+| `MeshHeadingList` | `mesh_terms` / `topics` | 主题标签 |
+| `KeywordList` | `topics` | MeSH 不足时补充 |
+
+### 证据等级
+
+`evidence_level` 由 `PublicationType` 映射：
+
+| PublicationType 含 | evidence_level |
+|---|---|
+| Practice Guideline / Guideline | guideline |
+| Consensus Development Conference | consensus |
+| Meta-Analysis | meta_analysis |
+| Systematic Review | systematic_review |
+| Randomized Controlled Trial | rct |
+| Clinical Trial | clinical_trial |
+| Observational Study / Cohort | cohort |
+| Case-Control | case_control |
+| Review | review |
+| 其他 | other |
+
+`rank_refs.py --profile medicine` 按 `assets/profiles/medicine.json` 的 `evidence_weights` 加权。
+
+### 限制
+
+- PubMed 不提供被引数：`cited_by=0`，靠 OpenAlex 合并同 DOI 记录补被引
+- 不提供 `referenced_works`：医学模板的引文覆盖会偏低，报告要如实写"引文关系不足"
+- 指南、共识常有独立网站版本，PubMed 可能只收录摘要，需人工补原文
+
+## Crossref：只做回验
+
+`verify_doi.py` 用 Crossref 核对 DOI 元数据：
 
 ```
-search_query=all:"graph neural network" AND all:"drug discovery"
-sortBy=relevance&max_results=50
+GET https://api.crossref.org/works/<doi>
 ```
 
-### 解析要点
+判定口径：
 
-- 命名空间：Atom `http://www.w3.org/2005/Atom`，arXiv 扩展 `http://arxiv.org/schemas/atom`
-- 标题与摘要字段常有换行和多余空格，需 `" ".join(text.split())` 规整
-- `arxiv:doi` 可能为空——这时用 `id`（`http://arxiv.org/abs/2401.xxxxx`）作为链接
-- `arxiv:primary_category@term` 给分类码（如 `cs.LG`），可作为主题标签
-- **请求间隔至少 3 秒**，连续快跑会被限流
-
-## 不接入 Crossref
-
-本项目只允许 OpenAlex + arXiv。需要回验 DOI 时，用浏览器打开 `https://doi.org/<doi>` 人工确认，不要在脚本里新增 Crossref 或其他数据源请求。`scripts/verify_doi.py` 不属于主流程，不应被自动调用。
-
-## 综述/教程识别与去噪
-
-`fetch_refs.py` 不是只搜 `review` 关键词，而是合并三路信号：
-
-| 信号 | 强度 | 说明 |
+| 状态 | 条件 | 处理 |
 |---|---|---|
-| OpenAlex `type:review` | 强 | 出版方已标注，但覆盖不全 |
-| 标题模式 | 强 | `survey / review / overview / tutorial / state of the art / advances in / progress in / comprehensive review / roadmap / taxonomy / open problems` |
-| 摘要模式 | 中 | `this paper surveys`、`we review`、`we provide an overview`、`literature review`、`systematic review`、`meta-analysis` |
+| `verified` | 标题相似度 ≥0.92 且年份/第一作者基本一致 | 放行 |
+| `partial` | 有字段不一致但不严重 | 放行并标记 |
+| `link_only` | 无 DOI，但有 arXiv/PubMed/landing page | 放行，标"按链接回溯" |
+| `mismatch` | 标题相似度 <0.92 或年份/作者冲突 | 剔除 |
+| `not_found` | Crossref 404 | 剔除 |
+| `no_doi` | 无 DOI 且无链接 | 剔除 |
+| `error` | 网络异常 | 剔除（宁可少一篇） |
 
-标题反例 `peer review` / `reviewer` / `book review` / `code review` 会先排除。标题带 `tutorial` 的单独标记，作为最优先的骨架。
+**不要**用 Crossref 做检索或补文献。它只负责"这条记录是不是真的"。
 
-去噪不只看"关键词出现过"，而是算主题中心度：
-
-| scope | 判定 | 去向 |
-|---|---|---|
-| `core` | 标题命中 focus，或摘要命中 focus ≥2 次 | 主分层 |
-| `mention` | 摘要只命中 focus 1 次 | 附录（仅提及） |
-| `related` | 只命中 broad 相邻词 | 附录（相邻领域） |
-| `off_topic` | 什么都未命中 | 检索阶段丢弃 |
-
-这样 "6G 综述里顺带提到 OTFS" 不会和 "OTFS 检测算法" 混进同一张必读清单。
-
-## 引文关系与演化顺序
-
-`rank_refs.py` 用 `referenced_works` 构建集合内引文图：
-
-- 边方向：被引文献 → 引用文献（时间流）
-- 深度：入度为 0 的节点为 D0，引用 D0 的为 D1，依此类推
-- 深度相同再按年份排，不按时间流水账
-- 共被引：两篇文献被同一批集合内论文同时引用，说明常被放在一起比较
-- 若集合内边少于 3 条，标记"引文关系不足"并退回按年份排序；不得假装有演化顺序
-
-注意：OpenAlex 的 `referenced_works` 对预印本和新论文可能为空，覆盖率会写进 `citation_analysis.coverage`。覆盖率低时，演化顺序只能作参考。
-
-## 2026 年新论文优先
-
-三层机制：
-
-1. 检索层：`year_priority=true` 单独拉当年整年，按 `publication_date:desc`
-2. 排序层：`frontier` 当年优先，`score` 对近 12 个月加权
-3. 交付层：`latest` 当年排最前，报告标 "★当年"
-
-只靠"按被引数排序"会天然淘汰当年论文（被引 0）。只靠 `latest` 通道也不够——如果检索阶段没拿到，后面变不出来。
-
-## 时效性：为什么"最新"需要单独一条通道
-
-两个数据源的收录节奏完全不同：
+## 时效性：为什么"最新"需要单独通道
 
 | 源 | 从发表到可检索 | 说明 |
 |---|---|---|
-| arXiv | 当天～1 天 | 预印本，提交即上线，但未经同行评审 |
-| OpenAlex | 2 周～3 个月 | 依赖出版方回传元数据，期刊越慢它越慢 |
-| PubMed | 1～4 周 | 医学领域相对快 |
+| arXiv | 当天–1 天 | 预印本，未经评审 |
+| PubMed | 1–4 周 | 医学相对快 |
+| OpenAlex | 2 周–3 个月 | 依赖出版方回传 |
 
-这带来两个工程后果：
+两个工程后果：
 
-1. **按引用数排序天然抹掉最新论文**。刚上线的论文被引为 0，在任何"按影响力排序"的体系里都排不进去。所以脚本单独切一条 `latest` 通道，按发表日期倒序，不看引用。
-2. **数据截止日必须写进报告**。用户以为看到的是"今天的状态"，实际上可能停在三个月前。报告头部的"数据截止"就是这个提示。
+1. **按引用排序天然抹掉最新论文**（被引 0），所以单独切 `latest` 通道，按日期倒序
+2. **数据截止日必须写进报告**，否则用户以为看到的是"今天的状态"
 
-若用户要求"最新到上个月"：把 `recent_days` 调到 60–90，并把 arXiv 的 `submittedDate` 检索条数加大；同时接受一个现实——本月刚见刊的论文可能还没被索引，应当直接告知用户，而不是用旧论文凑数。
+用户要"最新到上个月"时：`recent_days` 调到 60–90，加大 arXiv/PubMed 日期检索条数，并明确告知本月刚见刊的论文可能还没被索引。
 
 ## 缓存
 
-`fetch_refs.py` 默认把每个响应按 `sha1(url+params)` 缓存到 `.cache/refs/`，有效期 30 天。
+`fetch_refs.py` 默认把响应按 `sha1(url+params)` 缓存到系统临时目录 `research-landscape-cache/`，有效期 30 天。
 
-意义有两点：
-
-1. 省额度（OpenAlex 按 IP 共享，重复检索很浪费）
-2. 让调试可复现——改排序规则时不该重新拉数据
-
-`--no-cache` 强制刷新，只在确认数据源已更新时用。
+意义：省额度（OpenAlex 按 IP 共享）、让调试可复现。`--no-cache` 强制刷新，只在确认数据源已更新时用。
 
 ## 数据源覆盖边界（必须告知用户）
 
-报告里要写清这几条，否则用户会误以为拿到了全量：
-
-- 不覆盖中文文献（CNKI / 万方），中文综述建议用户自行补充
-- 不覆盖未被 OpenAlex 收录的期刊（部分中文核心、部分会议）
-- 会议论文在 OpenAlex 的覆盖率低于期刊，CS 领域尤其要注意顶会论文可能漏
-- 最新 3 个月的预印本可能尚未收录进 OpenAlex，需靠 arXiv 补
+- 不覆盖中文文献（CNKI / 万方），中文综述需自行补充
+- 不覆盖未被 OpenAlex / PubMed 收录的期刊与会议
+- CS 顶会在 OpenAlex 覆盖率低于期刊，可能漏检
+- 医学指南/共识的权威版本常在机构网站，PubMed 可能只有摘要
+- 最新 3 个月的期刊论文可能尚未建索引，靠 arXiv/PubMed 日期检索兜底

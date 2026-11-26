@@ -73,6 +73,33 @@ def cite(rec: dict) -> str:
     return f"({surname}, {year})"
 
 
+EVIDENCE_LABELS = {
+    "guideline": "指南",
+    "consensus": "专家共识",
+    "meta_analysis": "Meta 分析",
+    "systematic_review": "系统综述",
+    "rct": "RCT",
+    "clinical_trial": "临床试验",
+    "cohort": "队列研究",
+    "case_control": "病例对照",
+    "review": "综述",
+    "other": "未标注",
+}
+
+
+def profile_column(rec: dict, profile_name: str) -> str:
+    """必读表里的学科附加列：医学看证据类型，CS 看发表处/是否预印本。"""
+    if profile_name == "medicine":
+        level = (rec.get("evidence_level") or "").lower()
+        return EVIDENCE_LABELS.get(level, "未标注")
+    if profile_name == "cs":
+        venue = (rec.get("venue") or "").strip()
+        if (rec.get("type") or "") == "preprint" or "arxiv" in venue.lower():
+            return "预印本（arXiv）"
+        return venue or "未标注"
+    return ""
+
+
 def ref_link(rec: dict) -> str:
     doi = (rec.get("doi") or "").strip()
     if doi:
@@ -166,6 +193,13 @@ def validate(plan: dict, refs: dict) -> list:
     records = refs.get("records", {})
     tiers = refs.get("tiers", {})
 
+    def blocked_reason(key: str) -> str:
+        if key not in records:
+            return "不存在于检索结果"
+        if records[key].get("_blocked"):
+            return "已被 DOI 回验剔除"
+        return ""
+
     used_keys = set()
 
     for line in plan.get("landscape") or []:
@@ -176,22 +210,39 @@ def validate(plan: dict, refs: dict) -> list:
             if not key:
                 errors.append(f"landscape/{line.get('line')}: 节点缺少 ref_key")
                 continue
-            if key not in records:
-                errors.append(f"landscape: ref_key 不存在于检索结果 -> {key}")
+            reason = blocked_reason(key)
+            if reason:
+                errors.append(f"landscape/{line.get('line')}: {key} {reason}")
             used_keys.add(key)
 
-    for route in plan.get("routes") or []:
+    landscape_items = [l for l in (plan.get("landscape") or [])
+                       if (l.get("line") or "").strip()]
+    if not landscape_items:
+        errors.append("landscape: 至少需要 1 条主线；确实无法给出时，要在正文说明原因")
+    for line_item in landscape_items:
+        if not [st for st in (line_item.get("stages") or [])
+                if (st.get("label") or "").strip()]:
+            errors.append(
+                f"landscape/{line_item.get('line')}: 至少需要 1 个节点（起点/跃迁/SOTA）")
+
+    routes = [r for r in (plan.get("routes") or [])
+              if (r.get("family") or "").strip()]
+    if not routes:
+        errors.append("routes: 至少需要 1 条方法族；每条必须挂真实论文")
+    for route in routes:
         family = route.get("family") or "(未命名方法族)"
         if not (route.get("idea") or "").strip():
             errors.append(f"routes/{family}: 缺少核心思想")
-        if not route.get("ref_keys"):
-            errors.append(f"routes/{family}: 缺少代表工作")
+        valid_keys = [k for k in (route.get("ref_keys") or []) if (k or "").strip()]
+        if not valid_keys:
+            errors.append(f"routes/{family}: 缺少代表工作（ref_keys 不能为空或只含空串）")
         for key in route.get("ref_keys") or []:
             key = (key or "").strip()
             if not key:
                 continue
-            if key not in records:
-                errors.append(f"routes/{family}: ref_key 不存在于检索结果 -> {key}")
+            reason = blocked_reason(key)
+            if reason:
+                errors.append(f"routes/{family}: {key} {reason}")
             used_keys.add(key)
 
     why_read = plan.get("why_read") or {}
@@ -220,6 +271,8 @@ def validate(plan: dict, refs: dict) -> list:
 
     terms = plan.get("terms") or []
     terms = [t for t in terms if (t.get("zh") or "").strip()]
+    if not terms:
+        errors.append("terms: 术语表不能为空（产物契约要求至少 1 条，且每条有来源）")
     if len(terms) > MAX_TERMS:
         errors.append(f"terms: {len(terms)} 条超过上限 {MAX_TERMS}")
     for term in terms:
@@ -232,11 +285,19 @@ def validate(plan: dict, refs: dict) -> list:
             errors.append(f"terms/{term.get('zh')}: 解释 {len(definition)} 字，超过 {MAX_TERM_DEF} 字")
 
     gaps = plan.get("gaps") or []
+    if not gaps:
+        errors.append("gaps: 疑似空白不能为空；确实无法给出时，写一条说明检索范围与未见的候选")
     if len(gaps) > MAX_GAPS:
         errors.append(f"gaps: {len(gaps)} 条超过上限 {MAX_GAPS}")
     for gap in gaps:
-        if not (gap.get("evidence") or "").strip():
+        evidence = (gap.get("evidence") or "").strip()
+        if not evidence:
             errors.append(f"gaps/{gap.get('gap')}: 缺少证据（禁止无依据的空白断言）")
+        elif len(evidence) < 10 or not re.search(
+                r"本次检索|未见|未发现|检索|篇|范围|未命中", evidence):
+            errors.append(
+                f"gaps/{gap.get('gap')}: 证据缺少检索范围或限定词"
+                "（应写“本次检索 N 篇中未见……”而不是“尚属空白”）")
 
     card = plan.get("direction_card") or {}
     if not (card.get("question") or "").strip():
@@ -266,8 +327,9 @@ def render(plan: dict, refs: dict) -> str:
     if plan.get("time_budget"):
         add(f"> 时间预算：{plan['time_budget']}")
     sources = "、".join(
-        sorted({"openalex": "OpenAlex", "arxiv": "arXiv"}.get(s.lower(), s)
-               for s in {s for r in records.values() for s in (r.get("sources") or [r.get("source")])})
+        sorted({"openalex": "OpenAlex", "arxiv": "arXiv", "pubmed": "PubMed"}.get(s.lower(), s)
+               for s in {x for r in records.values()
+                         for x in (r.get("sources") or [r.get("source")]) if x})
     )
     year_range = ""
     years = [r.get("year") for r in records.values() if r.get("year")]
@@ -279,12 +341,20 @@ def render(plan: dict, refs: dict) -> str:
         add(f"> 数据截止：{newest}")
     scope_counts = meta.get("scope_counts") or {}
     if scope_counts:
+        merged = meta.get("related_merged_count", 0)
+        merged_note = f"（其中 {merged} 篇为相邻领域兜底）" if merged else ""
         add(f"> 去噪：原始 {meta.get('raw_count', 0)} 篇 → 去重 {meta.get('deduped_count', 0)} 篇"
-            f" → 主题核心 {scope_counts.get('core', 0)} 篇；"
+            f" → 主题核心 {scope_counts.get('core', 0)} 篇{merged_note}；"
             f"仅提及/相邻领域 {meta.get('mention_only_count', 0)} 条单列，不进必读")
     current_year = meta.get("current_year_count")
     if current_year:
         add(f"> 当年优先：{meta.get('year_now') or ''} 年论文 {current_year} 篇已进入候选，前沿层当年优先")
+    profile_name = meta.get("profile") or plan.get("profile") or "general"
+    profile_label = meta.get("profile_label") or {
+        "general": "通用学科", "cs": "计算机 / AI / 通信",
+        "medicine": "医学 / 生命科学",
+    }.get(profile_name, profile_name)
+    add(f"> 学科模板：{profile_label}")
     add(f"> 生成日期：{datetime.now().strftime('%Y-%m-%d')}")
     add("")
 
@@ -353,7 +423,8 @@ def render(plan: dict, refs: dict) -> str:
             "演化顺序见下面各主线的“起点 → 跃迁 → SOTA”。".format(
                 citation.get("coverage", 0)))
         add("")
-        top = citation.get("top_cited") or []
+        top = [x for x in (citation.get("top_cited") or [])
+               if not (records.get(x.get("ref_key")) or {}).get("_blocked")]
         if top:
             add("| # | 文献 | 年份 | 集合内被引 |")
             add("|---|---|---|---|")
@@ -362,7 +433,9 @@ def render(plan: dict, refs: dict) -> str:
                     idx, esc(short_title(item.get("title"), 70)),
                     esc(item.get("year") or ""), item.get("in_set_cited", 0)))
             add("")
-        co = citation.get("co_cited") or []
+        co = [p for p in (citation.get("co_cited") or [])
+              if not (records.get(p.get("a")) or {}).get("_blocked")
+              and not (records.get(p.get("b")) or {}).get("_blocked")]
         if co:
             add("**共被引对**（被同一批论文同时引用，说明经常被放在一起比较）")
             add("")
@@ -431,8 +504,14 @@ def render(plan: dict, refs: dict) -> str:
     target = meta.get("target_count") or total
     add(f"> 编号即阅读顺序。共 {total} 篇，按每周 3 篇约需 {weeks} 周。")
     if target and target != total:
-        add(f"> 配额目标 {target} 篇，实际入选 {total} 篇；"
-            "缺口原因是去噪后符合条件的候选不足，未用仅提及主题的关联文献凑数。")
+        verify_stats = refs.get("_verify_stats") or {}
+        blocked = verify_stats.get("blocked_tiers", 0)
+        if blocked:
+            add(f"> 配额目标 {target} 篇，实际入选 {total} 篇；"
+                f"其中 {blocked} 篇因 DOI 回验未通过被剔除，未用仅提及主题的关联文献凑数。")
+        else:
+            add(f"> 配额目标 {target} 篇，实际入选 {total} 篇；"
+                "缺口原因是去噪后符合条件的候选不足，未用仅提及主题的关联文献凑数。")
     elif target:
         add(f"> 配额目标 {target} 篇，实际入选 {total} 篇，数量一致。")
     add("")
@@ -455,16 +534,28 @@ def render(plan: dict, refs: dict) -> str:
         if hint:
             add(f"> {hint}")
             add("")
-        add("| # | 文献 | 年份 | 为什么必读 |")
-        add("|---|---|---|---|")
+        extra_col = {"medicine": "证据类型", "cs": "发表处/类型"}.get(profile_name)
+        if extra_col:
+            add(f"| # | 文献 | 年份 | {extra_col} | 为什么必读 |")
+            add("|---|---|---|---|---|")
+        else:
+            add("| # | 文献 | 年份 | 为什么必读 |")
+            add("|---|---|---|---|")
         for rec in items:
             counter += 1
             link = ref_link(rec)
             label = f"[{short_title(rec.get('title'), 80)}]({link})" if link else short_title(rec.get("title"), 80)
-            add("| {} | {} | {} | {} |".format(
-                counter, esc(label), esc(rec.get("year") or ""),
-                esc(why_read.get(rec["ref_key"]) or ""),
-            ))
+            if extra_col:
+                add("| {} | {} | {} | {} | {} |".format(
+                    counter, esc(label), esc(rec.get("year") or ""),
+                    esc(profile_column(rec, profile_name)),
+                    esc(why_read.get(rec["ref_key"]) or ""),
+                ))
+            else:
+                add("| {} | {} | {} | {} |".format(
+                    counter, esc(label), esc(rec.get("year") or ""),
+                    esc(why_read.get(rec["ref_key"]) or ""),
+                ))
         add("")
 
     if counter >= 3:
@@ -477,11 +568,22 @@ def render(plan: dict, refs: dict) -> str:
                     first_three.append(str(idx))
         add(f"**如果只有一周**：读 {'、'.join(first_three)} 号。")
         add("")
+    if profile_name == "medicine":
+        add("> 医学模板：清单应包含指南/共识；表中证据类型来自 PubMed 出版类型，"
+            "标注为\"未标注\"的条目需打开原文核对研究设计。预印本与已发表文献不要混用同一结论。")
+        add("")
+    elif profile_name == "cs":
+        add("> CS 模板：顶会加权已生效；发表处为 arXiv 的条目是预印本，未必经同行评审，"
+            "引用前先确认是否已被会议接收。")
+        add("")
 
     # 五、近期进展
     latest = refs.get("latest") or []
     year_now = meta.get("year_now") or datetime.now().year
-    add(f"## 五、近期进展（近 6 个月，{year_now} 年优先）")
+    recent_days = int(meta.get("recent_days") or 183)
+    window_label = (f"近 {round(recent_days / 30)} 个月" if recent_days >= 60
+                    else f"近 {recent_days} 天")
+    add(f"## 五、近期进展（{window_label}，{year_now} 年优先）")
     add("")
     if latest:
         add("> 这一节不看被引数——刚上线的论文引用必然是 0，按引用排序永远进不了必读清单。"
@@ -509,7 +611,7 @@ def render(plan: dict, refs: dict) -> str:
     if terms:
         add("## 六、术语表")
         add("")
-        add("> 术语种子优先取自综述/教程；OpenAlex/arXiv 只给摘要，"
+        add("> 术语种子优先取自综述/教程/指南；数据源只提供摘要，"
             "未能读取 Introduction 与 Related Work 全文，来源已如实标注。")
         add("")
         add("| 术语 | 英文 | 层 | 来源 | 一句话解释 |")
@@ -538,24 +640,8 @@ def render(plan: dict, refs: dict) -> str:
             ))
         add("")
     else:
-        add("> 本版本未对空白做证据验证。以下为机器可识别的\"信号\"，仅供进一步查证。")
-        add("")
-        signals = conflict_signals(refs)
-        if signals:
-            add("| # | 信号强度 | 文献 | 年份 | 可能的争议点 |")
-            add("|---|---|---|---|---|")
-            for idx, sig in enumerate(signals, start=1):
-                link = ref_link(sig)
-                label = (f"[{short_title(sig.get('title'), 76)}]({link})"
-                         if link else short_title(sig.get("title"), 76))
-                add("| {} | {} | {} | {} | {} |".format(
-                    idx, esc(sig.get("score")), esc(label), esc(sig.get("year") or ""),
-                    esc("表述与同主题其他文献存在冲突，需核对原文"),
-                ))
-            add("")
-            add("_这些只是检索信号，不构成研究空白结论；立项前需逐篇核对原文，并确认无人已做。_")
-        else:
-            add("_本次检索未命中冲突信号，建议用关键词组合到 CNKI / Google Scholar 人工复核。_")
+        add("> plan.gaps 为空。按产物契约，渲染前校验会直接拒绝；"
+            "若通过其他方式绕过，请人工补写空白候选，不要用冲突信号代替结论。")
         add("")
 
     # 七、覆盖边界
@@ -571,6 +657,7 @@ def render(plan: dict, refs: dict) -> str:
     if verify_stats.get("applied"):
         add(f"- DOI 回验：通过 {verify_stats.get('verified', 0)} 篇，"
             f"部分一致 {verify_stats.get('partial', 0)} 篇，"
+            f"无 DOI 按链接回溯 {verify_stats.get('link_only', 0)} 篇，"
             f"未通过剔除 {verify_stats.get('blocked', 0)} 篇")
     else:
         add("- DOI 回验：本次未执行（仅做过格式校验，未向 Crossref 核对）")
@@ -595,7 +682,7 @@ def render(plan: dict, refs: dict) -> str:
             "主线演化按引文关系与年份综合判断")
     else:
         add("- 引文关系：不足，演化顺序退回按年份；需在 OpenAlex 补齐 referenced_works 后重跑")
-    add("- 术语来源：综述/教程摘要；未读取 Introduction 与 Related Work 全文，"
+    add("- 术语来源：综述/指南摘要；未读取 Introduction 与 Related Work 全文，"
         "这是数据源限制，不是术语已经过全文核验")
     if plan.get("boundary_notes"):
         add(f"- 覆盖限制：{plan['boundary_notes']}")
@@ -639,7 +726,7 @@ def render(plan: dict, refs: dict) -> str:
         add("")
 
     add("---")
-    add("*本报告由文献检索结果自动生成，文献元数据均来自 OpenAlex / arXiv。"
+    add(f"*本报告由文献检索结果自动生成，文献元数据均来自 {sources or 'OpenAlex / arXiv'}。"
         "所有文献条目可回溯，猜测性判断已标注。*")
     add("")
     return "\n".join(lines)
@@ -690,7 +777,8 @@ def apply_verification(refs: dict) -> tuple[dict, list, dict]:
     """
     records = refs.get("records") or {}
     blocked: list = []
-    stats = {"applied": True, "verified": 0, "partial": 0, "blocked": 0}
+    stats = {"applied": True, "verified": 0, "partial": 0,
+             "link_only": 0, "blocked": 0, "blocked_tiers": 0}
 
     def status_of(rec: dict) -> str:
         key = rec.get("ref_key")
@@ -711,8 +799,16 @@ def apply_verification(refs: dict) -> tuple[dict, list, dict]:
                 stats["partial"] += 1
                 rec["doi_verify_note"] = "部分字段与 Crossref 不一致"
                 kept.append(rec)
+            elif status == "link_only":
+                stats["link_only"] += 1
+                rec["doi_verify_note"] = "无 DOI，按链接回溯"
+                kept.append(rec)
             else:
                 stats["blocked"] += 1
+                stats["blocked_tiers"] += 1
+                holder = records.get(rec.get("ref_key"))
+                if isinstance(holder, dict):
+                    holder["_blocked"] = True
                 blocked.append({
                     "ref_key": rec.get("ref_key"),
                     "title": rec.get("title"),
@@ -723,7 +819,32 @@ def apply_verification(refs: dict) -> tuple[dict, list, dict]:
     for lane in ("latest", "peripheral"):
         items = refs.get(lane) or []
         if items:
-            refs[lane] = [r for r in items if status_of(r) in ("verified", "partial")]
+            kept_lane = []
+            for item in items:
+                status = status_of(item)
+                if status in ("verified", "partial"):
+                    kept_lane.append(item)
+                elif status == "link_only":
+                    item["doi_verify_note"] = "无 DOI，按链接回溯"
+                    kept_lane.append(item)
+                else:
+                    stats["blocked"] += 1
+                    blocked.append({
+                        "ref_key": item.get("ref_key"),
+                        "title": item.get("title"),
+                        "status": status,
+                        "lane": lane,
+                    })
+                    holder = records.get(item.get("ref_key"))
+                    if isinstance(holder, dict):
+                        holder["_blocked"] = True
+            refs[lane] = kept_lane
+
+    meta = refs.setdefault("meta", {})
+    meta["quota_actual"] = {
+        tier: len(refs.get("tiers", {}).get(tier, [])) for tier in TIER_ORDER
+    }
+    meta["selected_count"] = sum(meta["quota_actual"].values())
 
     refs["_verify_stats"] = stats
     return refs, blocked, stats
@@ -736,8 +857,14 @@ def conflict_signals(refs: dict, limit: int = 6) -> list:
     机器只能给出“这两篇可能互相对着干”的线索，不能替你下结论。
     """
     records = refs.get("records") or {}
+    allowed = {"verified", "partial", "link_only"}
     hits = []
     for key, rec in records.items():
+        if rec.get("_blocked"):
+            continue
+        status = (rec.get("doi_verification") or {}).get("status")
+        if status and status not in allowed:
+            continue
         score = rec.get("conflict_signal") or 0
         if score > 0 and (rec.get("doi") or rec.get("url")):
             hits.append((score, rec))
@@ -779,16 +906,9 @@ def main() -> int:
         parser.error("渲染模式需要同时提供 --plan 与 --out")
 
     plan = load_json(Path(args.plan))
-    errors = validate(plan, refs)
-    if errors:
-        print("校验未通过，已中止渲染：", file=sys.stderr)
-        for err in errors:
-            print("  - " + err, file=sys.stderr)
-        print(f"\n共 {len(errors)} 处问题。修正 plan.json 后重试；"
-              f"不要为了通过校验而删规则。", file=sys.stderr)
-        return 1
 
-    # DOI 回验门禁：有回验结果就自动生效，显式 --verify 则强制要求
+    # DOI 回验门禁：先回验，再校验 plan。
+    # 顺序反了会漏掉"plan 引用了被回验剔除的文献"这类问题。
     if not args.no_verify:
         has_verify = any(
             (rec or {}).get("doi_verification")
@@ -806,7 +926,17 @@ def main() -> int:
                 for item in blocked:
                     print(f"  - [{item['status']}] {item['title'][:60] if item['title'] else item['ref_key']}")
             else:
-                print(f"DOI 回验：{stats['verified']} 篇通过，无剔除")
+                print(f"DOI 回验：{stats['verified']} 篇通过，"
+                      f"{stats.get('link_only', 0)} 篇按链接回溯，无剔除")
+
+    errors = validate(plan, refs)
+    if errors:
+        print("校验未通过，已中止渲染：", file=sys.stderr)
+        for err in errors:
+            print("  - " + err, file=sys.stderr)
+        print(f"\n共 {len(errors)} 处问题。修正 plan.json 后重试；"
+              f"不要为了通过校验而删规则。", file=sys.stderr)
+        return 1
 
     report = render(plan, refs)
     out_path = Path(args.out)

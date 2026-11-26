@@ -1,0 +1,25 @@
+{
+  "name": "cs",
+  "label": "计算机 / AI / 通信",
+  "sources": "openalex,arxiv",
+  "default_categories": ["cs.LG", "cs.AI", "cs.CL", "cs.CV", "cs.IT", "eess.SP", "eess.IV"],
+  "default_mesh": [],
+  "max_refs": 25,
+  "recent_days": 183,
+  "foundational_age": 5,
+  "top_venues": [
+    "NeurIPS", "NIPS", "ICML", "ICLR", "AAAI", "IJCAI",
+    "CVPR", "ICCV", "ECCV", "ACL", "EMNLP", "NAACL", "COLING",
+    "KDD", "SIGIR", "WWW", "WSDM", "CIKM", "RecSys",
+    "ICSE", "FSE", "ASE", "ISSTA", "OSDI", "SOSP", "NSDI", "ATC",
+    "SIGCOMM", "MobiCom", "MobiSys", "INFOCOM", "ICC", "GLOBECOM", "WCNC", "VTC",
+    "CCS", "USENIX Security", "S&P", "NDSS",
+    "PLDI", "POPL", "OOPSLA", "ASPLOS", "ISCA", "MICRO", "SC",
+    "VLDB", "SIGMOD", "ICDE", "JMLR", "TPAMI"
+  ],
+  "evidence_weights": {},
+  "review_prefer": ["survey", "tutorial", "review"],
+  "coverage_note": "覆盖 arXiv（当日收录）与 OpenAlex 收录的会议/期刊；顶会论文在 OpenAlex 的覆盖率低于期刊，CS 领域可能漏掉部分顶会，需用 DBLP 人工补查。",
+  "search_note": "CS 领域以顶会为主、期刊次之；arXiv 必须跑，否则会漏掉最近半年的 SOTA。综述多叫 survey。",
+  "report_sections": ["顶会/预印本标注", "代码与数据可得性"]
+}

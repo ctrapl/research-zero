@@ -36,6 +36,7 @@ except Exception:
     pass
 
 TIER_ORDER = ("review", "foundational", "frontier", "competitive", "core")
+PROFILE_DIR = Path(__file__).resolve().parent.parent / "assets" / "profiles"
 TIER_LABEL = {
     "review": "骨架（综述/教程）",
     "foundational": "奠基性（早期高被引）",
@@ -79,8 +80,18 @@ STOPWORDS = {
 }
 
 
+def load_profile(name: str) -> dict:
+    if not name:
+        return {}
+    path = PROFILE_DIR / f"{name}.json"
+    if not path.exists():
+        available = ", ".join(sorted(p.stem for p in PROFILE_DIR.glob("*.json")))
+        raise SystemExit(f"学科模板不存在：{name}；可用：{available}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def norm_title(title: str) -> str:
-    text = re.sub(r"[^a-z0-9]+", " ", (title or "").lower())
+    text = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", (title or "").lower())
     return " ".join(text.split())
 
 
@@ -138,6 +149,7 @@ def merge_group(group: list) -> dict:
     fields = (
         "title", "abstract", "authors", "venue", "doi", "url", "year",
         "type", "topics", "pub_date", "openalex_id", "scope",
+        "pmid", "evidence_level", "mesh_terms", "publication_types",
     )
     field_sources = {}
     for field in fields:
@@ -225,6 +237,7 @@ def dedupe(records: list) -> tuple[list, int]:
 
     doi_owner = {}
     title_author_groups = {}
+    title_groups = {}
 
     for i, rec in enumerate(records):
         doi = clean_doi(rec.get("doi"))
@@ -243,6 +256,19 @@ def dedupe(records: list) -> tuple[list, int]:
                 doi_owner[key_oa] = i
 
         title_key = norm_title(rec.get("title") or "")
+
+        # 同一篇工作的预印本与正式版：作者列表可能不同，但标题高度一致。
+        # 只对足够长的标题做标题级合并，避免短标题误伤。
+        if len(title_key) >= 20:
+            title_bucket = title_groups.setdefault(title_key, [])
+            current_year = get_year(rec)
+            for j in title_bucket:
+                other_year = get_year(records[j])
+                if (not current_year or not other_year
+                        or abs(current_year - other_year) <= 2):
+                    union(i, j)
+            title_bucket.append(i)
+
         author_key = get_author_key(rec)
         if title_key and author_key:
             key = (title_key, author_key)
@@ -305,7 +331,8 @@ def split_scopes(records: list, focus_terms: list) -> tuple[list, list, list]:
     return core, related, mention
 
 
-def score(rec: dict, year_now: int) -> float:
+def score(rec: dict, year_now: int, profile: dict = None) -> float:
+    profile = profile or {}
     year = rec.get("year") or year_now - 10
     age = max(0, year_now - year)
     authority = math.log1p(rec.get("cited_by") or 0)
@@ -315,7 +342,48 @@ def score(rec: dict, year_now: int) -> float:
     year_bonus = 2.5 if rec.get("recent_priority") else 0.0
     conflict_bonus = 0.4 if (rec.get("conflict_signal") or 0) >= 3 else 0.0
     return (1.2 * authority + 3.0 * recency + review_bonus +
-            focus_bonus + year_bonus + conflict_bonus)
+            focus_bonus + year_bonus + conflict_bonus +
+            venue_bonus(rec, profile) + evidence_bonus(rec, profile))
+
+
+def venue_bonus(rec: dict, profile: dict) -> float:
+    """CS 模板：顶会/顶刊命中给显式加成。
+
+    顶会论文的被引数常低于期刊，不加成会被"按引用排序"挤掉。
+    """
+    venues = profile.get("top_venues") or []
+    venue = (rec.get("venue") or "").lower()
+    if not venues or not venue:
+        return 0.0
+    for name in venues:
+        needle = name.lower()
+        if needle and needle in venue:
+            return 2.0
+    return 0.0
+
+
+def evidence_bonus(rec: dict, profile: dict) -> float:
+    """医学模板：指南/系统综述/RCT 等证据等级加权。"""
+    weights = profile.get("evidence_weights") or {}
+    level = (rec.get("evidence_level") or "").lower()
+    if not level or level == "other":
+        return 0.0
+    try:
+        return float(weights.get(level, 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def review_priority(rec: dict, profile: dict) -> int:
+    """综述层的学科偏好排序：指南/系统综述/meta 优先于普通 review。"""
+    prefer = profile.get("review_prefer") or []
+    if not prefer:
+        return 0
+    text = ((rec.get("title") or "") + " " + (rec.get("abstract") or "")).lower()
+    for idx, needle in enumerate(prefer):
+        if needle.lower() in text:
+            return idx
+    return len(prefer)
 
 
 def allocate_targets(max_refs: int) -> dict:
@@ -330,13 +398,16 @@ def allocate_targets(max_refs: int) -> dict:
     return base
 
 
-def take(pool: list, count: int, name: str, used: set, year_now: int) -> list:
+def take(pool: list, count: int, name: str, used: set, year_now: int,
+         profile: dict = None) -> list:
     if count <= 0:
         return []
+    profile = profile or {}
 
     def key(rec):
         if name == "review":
-            return (-(rec.get("cited_by") or 0), -(rec.get("year") or 0))
+            return (review_priority(rec, profile),
+                    -(rec.get("cited_by") or 0), -(rec.get("year") or 0))
         if name == "foundational":
             return (-(rec.get("cited_by") or 0), rec.get("year") or 9999)
         if name == "frontier":
@@ -344,7 +415,7 @@ def take(pool: list, count: int, name: str, used: set, year_now: int) -> list:
                     -(rec.get("year") or 0), -(rec.get("cited_by") or 0))
         if name == "competitive":
             return (-(rec.get("conflict_signal") or 0), -(rec.get("cited_by") or 0))
-        return (-score(rec, year_now), -(rec.get("year") or 0))
+        return (-score(rec, year_now, profile), -(rec.get("year") or 0))
 
     out = []
     for rec in sorted(pool, key=key):
@@ -358,16 +429,19 @@ def take(pool: list, count: int, name: str, used: set, year_now: int) -> list:
     return out
 
 
-def assign_tiers(records: list, year_now: int, max_refs: int) -> tuple[dict, dict, dict, list]:
+def assign_tiers(records: list, year_now: int, max_refs: int,
+                 profile: dict = None) -> tuple[dict, dict, dict, list]:
     """返回 tiers / 目标配额 / 实际入选 / warnings。"""
+    profile = profile or {}
     warnings = []
     used = set()
     tiers = {name: [] for name in TIER_ORDER}
+    foundational_age = int(profile.get("foundational_age") or 5)
 
     reviews = [r for r in records if r.get("is_review")]
     non_reviews = [r for r in records if not r.get("is_review")]
     foundational_pool = [
-        r for r in non_reviews if (r.get("year") or year_now) <= year_now - 5]
+        r for r in non_reviews if (r.get("year") or year_now) <= year_now - foundational_age]
     frontier_pool = [
         r for r in non_reviews if (r.get("year") or 0) >= year_now - 2]
     competitive_pool = [
@@ -391,7 +465,7 @@ def assign_tiers(records: list, year_now: int, max_refs: int) -> tuple[dict, dic
     actual = {name: 0 for name in TIER_ORDER}
 
     for name in TIER_ORDER:
-        got = take(pools[name], targets[name], name, used, year_now)
+        got = take(pools[name], targets[name], name, used, year_now, profile)
         tiers[name] = got
         actual[name] = len(got)
 
@@ -402,7 +476,7 @@ def assign_tiers(records: list, year_now: int, max_refs: int) -> tuple[dict, dic
         early_pool = [r for r in records if r["ref_key"] not in used]
         early_pool.sort(key=lambda r: (r.get("year") or year_now, -(r.get("cited_by") or 0)))
         got = take(early_pool[: targets["foundational"] * 2], targets["foundational"],
-                   "foundational", used, year_now)
+                   "foundational", used, year_now, profile)
         tiers["foundational"] = got
         actual["foundational"] = len(got)
         if got:
@@ -412,7 +486,7 @@ def assign_tiers(records: list, year_now: int, max_refs: int) -> tuple[dict, dic
         latest_pool = [r for r in records if r["ref_key"] not in used]
         latest_pool.sort(key=lambda r: (-(r.get("year") or 0), -(r.get("cited_by") or 0)))
         got = take(latest_pool[: targets["frontier"] * 2], targets["frontier"],
-                   "frontier", used, year_now)
+                   "frontier", used, year_now, profile)
         tiers["frontier"] = got
         actual["frontier"] = len(got)
         if got:
@@ -431,7 +505,7 @@ def assign_tiers(records: list, year_now: int, max_refs: int) -> tuple[dict, dic
         for name in fill_order:
             if total >= effective_max:
                 break
-            got = take(pools[name], 1, name, used, year_now)
+            got = take(pools[name], 1, name, used, year_now, profile)
             if got:
                 tiers[name].extend(got)
                 actual[name] += 1
@@ -760,7 +834,11 @@ def main() -> int:
                         help="主题核心词，逗号分隔；旧数据没有 scope 字段时用它补判")
     parser.add_argument("--peripheral-limit", type=int, default=20,
                         help="仅提及/相邻领域文献最多展示条数")
+    parser.add_argument("--profile", default="",
+                        help="学科模板：general / cs / medicine")
     args = parser.parse_args()
+
+    profile = load_profile(args.profile)
 
     year_now = args.year_now or datetime.now().year
     records = load(Path(args.inp))
@@ -775,30 +853,39 @@ def main() -> int:
     core_records, related_records, mention_records = split_scopes(merged, focus_terms)
 
     warnings = []
+    core_true_count = len(core_records)
+    related_merged = 0
     if len(core_records) < MIN_CORE_FOR_TIERS:
         if related_records:
             warnings.append(
                 f"主题核心文献仅 {len(core_records)} 篇，已把 {len(related_records)} 篇"
-                "相邻文献并入候选；分层代表性下降，必须在报告中说明。")
+                "相邻文献并入候选（标记 scope_fallback=related）；"
+                "分层代表性下降，必须在报告中说明。")
+            for rec in related_records:
+                rec["scope_fallback"] = "related"
             core_records = core_records + related_records
+            related_merged = len(related_records)
         if len(core_records) < MIN_CORE_FOR_TIERS:
             warnings.append(
                 f"去噪后主题核心文献仅 {len(core_records)} 篇，信息量不足以支撑开题；"
                 "建议放宽检索式或补充综述检索。")
 
+    has_link = [r for r in core_records if r.get("doi") or r.get("url")]
+    if len(has_link) < len(core_records):
+        warnings.append(
+            f"{len(core_records) - len(has_link)} 条主题记录缺少 DOI 与链接，已排除在清单外。")
+        core_records = has_link
+
     citation, citation_warnings = build_citation_analysis(core_records)
     warnings.extend(citation_warnings)
 
-    tiers, targets, actual, tier_warnings = assign_tiers(core_records, year_now, args.max_refs)
+    tiers, targets, actual, tier_warnings = assign_tiers(core_records, year_now, args.max_refs, profile)
     warnings.extend(tier_warnings)
 
     latest, latest_warnings = pick_latest(core_records, args.recent_days, args.latest_limit, year_now)
     warnings.extend(latest_warnings)
 
-    has_link = [r for r in core_records if r.get("doi") or r.get("url")]
-    if len(has_link) < len(core_records):
-        warnings.append(
-            f"{len(core_records) - len(has_link)} 条主题记录缺少 DOI 与链接，已排除在清单外。")
+
 
     timeline = build_timeline(core_records, year_now)
     terms = top_terms(core_records)
@@ -806,8 +893,11 @@ def main() -> int:
         [r for r in core_records if r.get("is_review")])
     warnings.extend(term_warnings)
 
+    selected_keys = {r["ref_key"] for name in TIER_ORDER for r in tiers[name]}
+    peripheral_pool = [r for r in (mention_records + related_records)
+                       if r["ref_key"] not in selected_keys]
     peripheral, homonym_count = build_peripheral(
-        mention_records + related_records, args.peripheral_limit)
+        peripheral_pool, args.peripheral_limit)
     if homonym_count:
         warnings.append(
             f"已剔除 {homonym_count} 条同名词记录：这些论文里的主题缩写属于其他学科，"
@@ -845,6 +935,8 @@ def main() -> int:
             "quota_consistent": total_selected == effective_max,
             "scope_counts": scope_counts,
             "core_count": len(core_records),
+            "core_true_count": core_true_count,
+            "related_merged_count": related_merged,
             "mention_only_count": len(peripheral),
             "homonym_count": homonym_count,
             "review_count": review_count,
@@ -853,6 +945,11 @@ def main() -> int:
             "citation_available": bool(citation.get("available")),
             "citation_coverage": citation.get("coverage", 0),
             "recent_days": args.recent_days,
+            "profile": args.profile or "general",
+            "profile_label": profile.get("label") or "通用学科",
+            "coverage_note": profile.get("coverage_note") or "",
+            "search_note": profile.get("search_note") or "",
+            "report_sections": profile.get("report_sections") or [],
             "latest_count": len(latest),
             "newest_date": max((r.get("pub_date") or "" for r in core_records), default=""),
             "focus_terms": focus_terms,

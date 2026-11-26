@@ -82,9 +82,16 @@ def verify_one(paper, mailto=""):
     doi = normalize_doi(paper.get("doi"))
 
     if not doi:
+        link = (paper.get("url") or "").strip()
+        if link.startswith("http"):
+            return {
+                "status": "link_only",
+                "reason": "无 DOI，按链接回溯（arXiv / PubMed / landing page）",
+                "link": link
+            }
         return {
             "status": "no_doi",
-            "reason": "没有 DOI"
+            "reason": "没有 DOI，也没有可访问链接"
         }
 
     headers = {
@@ -216,7 +223,8 @@ def main():
         )
     )
 
-    # 只检查四个最终入选文献层
+    # 回验覆盖：五层必读 + 近期进展 + 关联文献附录
+    # 只验五层会导致 latest 里不在五层的记录被下游当成"missing"剔除
     selected = {}
 
     for tier in (
@@ -232,6 +240,15 @@ def main():
             key = paper.get("ref_key")
 
             if key:
+                selected[key] = paper
+
+    for lane in ("latest", "peripheral"):
+
+        for paper in data.get(lane) or []:
+
+            key = paper.get("ref_key")
+
+            if key and key not in selected:
                 selected[key] = paper
 
     if not selected:
@@ -267,6 +284,21 @@ def main():
 
         if status != "no_doi":
             time.sleep(0.2)
+
+    blocked = (
+        counts.get("mismatch", 0)
+        + counts.get("not_found", 0)
+        + counts.get("no_doi", 0)
+        + counts.get("error", 0)
+    )
+    data["_verify_stats"] = {
+        "applied": True,
+        "verified": counts.get("verified", 0),
+        "partial": counts.get("partial", 0),
+        "link_only": counts.get("link_only", 0),
+        "blocked": blocked,
+        "counts": counts,
+    }
 
     output = Path(args.out)
 

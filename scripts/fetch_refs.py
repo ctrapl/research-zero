@@ -44,7 +44,10 @@ except Exception:
 
 OPENALEX_URL = "https://api.openalex.org/works"
 ARXIV_URL = "https://export.arxiv.org/api/query"
-USER_AGENT = "research-landscape-skill/1.0"
+PUBMED_ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+PROFILE_DIR = Path(__file__).resolve().parent.parent / "assets" / "profiles"
+USER_AGENT = "research-landscape-skill/1.3"
 CACHE_TTL_DAYS = 30
 LOW_YIELD_THRESHOLD = 40
 RECENT_DAYS = 183          # 近 6 个月算"最新"，可按需通过 spec 的 recent_days 覆盖
@@ -822,7 +825,8 @@ def to_arxiv_record(entry, focus_terms: list = None,
 def fetch_arxiv(terms: list, per_page: int, cache_dir: Path,
                 use_cache: bool, focus_terms: list = None,
                 categories: list = None, broad_terms: list = None,
-                context_terms: list = None) -> tuple[list, list]:
+                context_terms: list = None,
+                focus_and: bool = False) -> tuple[list, list]:
     records, warnings = [], []
     terms = [t for t in (terms or []) if t]
     focus_terms = [t for t in (focus_terms or []) if t] or terms
@@ -836,7 +840,8 @@ def fetch_arxiv(terms: list, per_page: int, cache_dir: Path,
         )
 
     # 同义词之间 OR；分类码作为精度过滤（eess.SP / cs.IT 等）
-    focus_clause = "(" + " OR ".join(
+    joiner = " AND " if (focus_and and len(focus_terms) > 1) else " OR "
+    focus_clause = "(" + joiner.join(
         'all:"{}"'.format(t) if " " in t else "all:" + t for t in focus_terms
     ) + ")"
     other = [t for t in terms if t not in focus_terms]
@@ -898,6 +903,293 @@ def fetch_arxiv(terms: list, per_page: int, cache_dir: Path,
 # ---------------------------------------------------------------- main
 
 
+# ---------------------------------------------------------------- PubMed
+
+
+EVIDENCE_MAP = (
+    ("practice guideline", "guideline"),
+    ("guideline", "guideline"),
+    ("consensus development conference", "consensus"),
+    ("meta-analysis", "meta_analysis"),
+    ("systematic review", "systematic_review"),
+    ("randomized controlled trial", "rct"),
+    ("clinical trial", "clinical_trial"),
+    ("observational study", "cohort"),
+    ("cohort", "cohort"),
+    ("case-control", "case_control"),
+    ("review", "review"),
+)
+
+MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def load_profile(name: str) -> dict:
+    """读取学科模板。名字为空返回空模板（等价 general 的默认值由代码兜底）。"""
+    if not name:
+        return {}
+    path = PROFILE_DIR / f"{name}.json"
+    if not path.exists():
+        available = ", ".join(sorted(p.stem for p in PROFILE_DIR.glob("*.json")))
+        raise SystemExit(f"学科模板不存在：{name}；可用：{available}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _pubmed_clause(term: str, field_name: str = "Title/Abstract") -> str:
+    term = term.strip()
+    if not term:
+        return ""
+    if " " in term or "-" in term or "/" in term:
+        return f'"{term}"[{field_name}]'
+    return f"{term}[{field_name}]"
+
+
+def pubmed_term(terms: list, focus_terms: list, mesh_terms: list,
+                year_from: int, year_to: int) -> str:
+    """构造 PubMed 检索式：主题 OR 簇 AND 其余词 AND MeSH AND 年份。"""
+    focus = [t for t in (focus_terms or []) if t] or [t for t in terms if t]
+    others = [t for t in terms if t not in focus]
+
+    parts = []
+    if focus:
+        parts.append("(" + " OR ".join(_pubmed_clause(t) for t in focus) + ")")
+    if others:
+        parts.append("(" + " AND ".join(_pubmed_clause(t) for t in others) + ")")
+    if mesh_terms:
+        parts.append("(" + " OR ".join(
+            f'"{t}"[MeSH Terms]' for t in mesh_terms) + ")")
+    if year_from and year_to:
+        parts.append(f'("{year_from}"[PDAT] : "{year_to}"[PDAT])')
+    return " AND ".join(parts)
+
+
+def _parse_pubdate(article) -> tuple[int | None, str]:
+    node = article.find(".//JournalIssue/PubDate")
+    if node is None:
+        node = article.find(".//ArticleDate")
+    if node is None:
+        return None, ""
+
+    year_text = (node.findtext("Year") or "").strip()
+    if not year_text:
+        medline = (node.findtext("MedlineDate") or "").strip()
+        match = re.search(r"(19|20)\d{2}", medline)
+        year_text = match.group(0) if match else ""
+    if not year_text.isdigit():
+        return None, ""
+
+    month_text = (node.findtext("Month") or "").strip()
+    month = 1
+    if month_text.isdigit():
+        month = max(1, min(12, int(month_text)))
+    elif month_text:
+        month = MONTHS.get(month_text[:4].lower(), MONTHS.get(month_text[:3].lower(), 1))
+    day_text = (node.findtext("Day") or "").strip()
+    day = int(day_text) if day_text.isdigit() else 1
+    return int(year_text), f"{year_text}-{month:02d}-{day:02d}"
+
+
+def _pubmed_evidence_level(publication_types: list) -> str:
+    joined = " | ".join(t.lower() for t in publication_types)
+    for needle, level in EVIDENCE_MAP:
+        if needle in joined:
+            return level
+    return "other"
+
+
+def to_pubmed_record(article, focus_terms: list = None,
+                     broad_terms: list = None, year_now: int = 0,
+                     context_terms: list = None) -> dict:
+    pmid = (article.findtext(".//MedlineCitation/PMID") or "").strip()
+    title = clean_text(article.findtext(".//ArticleTitle") or "")
+
+    abstract_parts = []
+    for node in article.findall(".//Abstract/AbstractText"):
+        text = clean_text("".join(node.itertext()))
+        if text:
+            label = (node.get("Label") or "").strip()
+            abstract_parts.append(f"{label}: {text}" if label else text)
+    abstract = " ".join(abstract_parts)
+
+    year, pub_date = _parse_pubdate(article)
+
+    doi = ""
+    for node in article.findall(".//ArticleIdList/ArticleId"):
+        if (node.get("IdType") or "").lower() == "doi":
+            doi = normalize_doi(node.text or "")
+            break
+    if not doi:
+        for node in article.findall(".//ELocationID"):
+            if (node.get("EIdType") or "").lower() == "doi":
+                doi = normalize_doi(node.text or "")
+                break
+
+    authors = []
+    for node in article.findall(".//AuthorList/Author")[:8]:
+        family = (node.findtext("LastName") or "").strip()
+        given = (node.findtext("ForeName") or "").strip()
+        collective = (node.findtext("CollectiveName") or "").strip()
+        name = " ".join(p for p in (given, family) if p) or collective
+        if name:
+            authors.append(name)
+
+    venue = clean_text(article.findtext(".//Journal/Title") or "")
+    publication_types = [
+        clean_text("".join(n.itertext()))
+        for n in article.findall(".//PublicationTypeList/PublicationType")
+    ]
+    publication_types = [p for p in publication_types if p]
+
+    mesh_terms = []
+    for node in article.findall(".//MeshHeadingList/MeshHeading/DescriptorName"):
+        name = clean_text(node.text or "")
+        if name and name not in mesh_terms:
+            mesh_terms.append(name)
+
+    keywords = [
+        clean_text("".join(n.itertext()))
+        for n in article.findall(".//KeywordList/Keyword")
+    ]
+    topics = (mesh_terms + [k for k in keywords if k not in mesh_terms])[:8]
+
+    if doi:
+        ref_key = "doi:" + doi
+    elif pmid:
+        ref_key = "pubmed:" + pmid
+    else:
+        ref_key = "title:" + title[:80]
+
+    review, review_signals = detect_review(
+        title, abstract, "review" if any(
+            "review" in p.lower() or "guideline" in p.lower()
+            for p in publication_types) else "")
+    relevance = compute_relevance(
+        title, abstract, focus_terms or [], broad_terms or [], context_terms or [])
+    evidence_level = _pubmed_evidence_level(publication_types)
+
+    return {
+        "ref_key": ref_key,
+        "pmid": pmid,
+        "title": title,
+        "year": year,
+        "cited_by": 0,
+        "venue": venue,
+        "authors": authors,
+        "abstract": abstract,
+        "doi": doi,
+        "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "",
+        "type": "article",
+        "is_review": bool(review),
+        "review_signals": review_signals,
+        "relevance": relevance["relevance"],
+        "scope": relevance["scope"],
+        "scope_reason": relevance["scope_reason"],
+        "matched_terms": relevance["matched_terms"],
+        "focus_hits_title": relevance["focus_hits_title"],
+        "focus_hits_abstract": relevance["focus_hits_abstract"],
+        "recent_priority": is_recent_priority(
+            pub_date, year, year_now or datetime.now().year),
+        "conflict_signal": conflict_signal(title, abstract),
+        "topics": topics,
+        "mesh_terms": mesh_terms,
+        "publication_types": publication_types,
+        "evidence_level": evidence_level,
+        "ref_count": 0,
+        "referenced_works": [],
+        "pub_date": pub_date,
+        "source": "pubmed",
+    }
+
+
+def fetch_pubmed(terms: list, focus_terms: list, mesh_terms: list,
+                 per_page: int, year_from: int, year_to: int,
+                 cache_dir: Path, use_cache: bool,
+                 mailto: str = "", api_key: str = "",
+                 broad_terms: list = None,
+                 context_terms: list = None) -> tuple[list, list]:
+    """PubMed E-utilities：esearch 拿 PMID，efetch 拿 XML。
+
+    两轮：相关性一轮 + 按发表日期一轮（补最新）。无 key 时限速 3 次/秒，
+    这里每轮 2 个请求，间隔 0.4 秒即可。
+    """
+    warnings = []
+    records = []
+    query = pubmed_term(terms, focus_terms, mesh_terms, year_from, year_to)
+    if not query:
+        return records, ["PubMed 检索式为空，已跳过。"]
+
+    seen = set()
+    jobs = [("relevance", max(10, per_page)),
+            ("pub_date", max(10, per_page // 2))]
+
+    for idx, (sort_by, retmax) in enumerate(jobs):
+        if idx > 0:
+            time.sleep(0.4)
+        params = {
+            "db": "pubmed",
+            "term": query,
+            "retmax": retmax,
+            "retmode": "json",
+            "sort": sort_by,
+            "datetype": "pdat",
+            "mindate": str(year_from),
+            "maxdate": str(year_to),
+        }
+        if mailto:
+            params["email"] = mailto
+        if api_key:
+            params["api_key"] = api_key
+        try:
+            raw = http_get(PUBMED_ESEARCH_URL, params, cache_dir, use_cache)
+            id_list = json.loads(raw).get("esearchresult", {}).get("idlist") or []
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"PubMed esearch 失败（{sort_by}）：{exc}")
+            continue
+
+        ids = [i for i in id_list if i and i not in seen]
+        if not ids:
+            continue
+        seen.update(ids)
+
+        time.sleep(0.4)
+        fetch_params = {"db": "pubmed", "id": ",".join(ids), "retmode": "xml"}
+        if mailto:
+            fetch_params["email"] = mailto
+        if api_key:
+            fetch_params["api_key"] = api_key
+        try:
+            raw = http_get(PUBMED_EFETCH_URL, fetch_params, cache_dir,
+                           use_cache, is_xml=True)
+            root = ET.fromstring(raw)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"PubMed efetch 失败（{sort_by}）：{exc}")
+            continue
+
+        for article in root.findall(".//PubmedArticle"):
+            try:
+                rec = to_pubmed_record(
+                    article, focus_terms, broad_terms or terms,
+                    datetime.now().year, context_terms)
+            except Exception:  # noqa: BLE001
+                continue
+            if not rec["title"] or is_noise_record(rec["title"], rec.get("type")):
+                continue
+            if rec.get("scope") == "off_topic":
+                continue
+            records.append(rec)
+
+    if not mesh_terms:
+        warnings.append(
+            "未提供 MeSH 词（spec.mesh），PubMed 检索精度有限；"
+            "医学方向建议补 2–3 个 MeSH 主题词。")
+    if not records:
+        warnings.append(
+            "PubMed 未返回记录：检查检索式、年份范围，或 NCBI 是否可达。")
+    return records, warnings
+
+
 def parse_years(text: str) -> tuple[int, int]:
     this_year = datetime.now().year
     if not text:
@@ -920,6 +1212,8 @@ def main() -> int:
     parser.add_argument("--years", default="", help="年份区间，如 2012-2026")
     parser.add_argument("--per-source", type=int, default=40, help="每源每轮条数")
     parser.add_argument("--sources", default="", help="数据源，逗号分隔；可用 spec.sources 指定")
+    parser.add_argument("--profile", default="",
+                        help="学科模板：general / cs / medicine（也可写在 spec.profile）")
     parser.add_argument("--cache-dir",
                         default=os.path.join(tempfile.gettempdir(), "research-landscape-cache"),
                         help="缓存目录，默认在系统临时目录下，避免写进技能目录或项目目录")
@@ -938,6 +1232,9 @@ def main() -> int:
             return 1
         spec = json.loads(spec_path.read_text(encoding="utf-8-sig"))
 
+    profile_name = (args.profile or spec.get("profile") or "").strip()
+    profile = load_profile(profile_name)
+
     core_terms = [t for t in (spec.get("core") or []) if t] or parse_terms(args.query)
     if not core_terms:
         print("必须提供 --spec 或 --query（至少一个检索词）。", file=sys.stderr)
@@ -947,11 +1244,21 @@ def main() -> int:
     focus_terms = [t for t in (spec.get("focus") or []) if t] or core_terms
     # context 用于排除同名词污染：focus 词附近必须出现这些领域词才算主题论文
     context_terms = [t for t in (spec.get("context") or []) if t]
-    categories = [c for c in (spec.get("categories") or []) if c]
+    categories = [c for c in (spec.get("categories") or profile.get("default_categories") or []) if c]
+    mesh_terms = [m for m in (spec.get("mesh") or profile.get("default_mesh") or []) if m]
     year_priority = spec.get("year_priority", True)
 
-    year_from, year_to = parse_years(args.years or spec.get("years") or "")
-    sources = {s.strip().lower() for s in (args.sources or spec.get("sources") or "openalex,arxiv").split(",") if s.strip()}
+    if args.years or spec.get("years"):
+        year_from, year_to = parse_years(args.years or spec.get("years") or "")
+    else:
+        window = int(profile.get("year_window") or 12)
+        year_to = datetime.now().year
+        year_from = year_to - window + 1
+    sources = {s.strip().lower() for s in (
+        args.sources or spec.get("sources") or profile.get("sources") or "openalex,arxiv"
+    ).split(",") if s.strip()}
+    recent_days = int(args.recent_days or spec.get("recent_days")
+                      or profile.get("recent_days") or RECENT_DAYS)
     cache_dir = Path(args.cache_dir)
     per_source = args.per_source
     if spec.get("per_source") and args.per_source == 40:
@@ -963,7 +1270,7 @@ def main() -> int:
         recs, warns = fetch_openalex(
             core_terms, broad_terms, year_from, year_to, per_source,
             cache_dir, not args.no_cache, args.mailto, args.api_key,
-            spec_recent_days=args.recent_days or spec.get("recent_days", 0),
+            spec_recent_days=recent_days,
             focus_terms=focus_terms,
             year_priority=year_priority,
             context_terms=context_terms,
@@ -971,11 +1278,29 @@ def main() -> int:
         records.extend(recs)
         warnings.extend(warns)
 
+    explicit_focus = bool(spec.get("focus"))
     if "arxiv" in sources:
         recs, warns = fetch_arxiv(
             core_terms, per_source, cache_dir, not args.no_cache,
             focus_terms=focus_terms,
             categories=categories,
+            broad_terms=broad_terms,
+            context_terms=context_terms,
+            focus_and=not explicit_focus,
+        )
+        records.extend(recs)
+        warnings.extend(warns)
+        if not explicit_focus:
+            warnings.append(
+                "spec 未给 focus（主题同义词簇）；arXiv 已改用 AND 语义收紧检索。"
+                "建议补 focus，否则主题中心度判断会偏宽。")
+
+    if "pubmed" in sources:
+        recs, warns = fetch_pubmed(
+            core_terms, focus_terms, mesh_terms, per_source,
+            year_from, year_to, cache_dir, not args.no_cache,
+            mailto=args.mailto,
+            api_key=os.environ.get("NCBI_API_KEY", ""),
             broad_terms=broad_terms,
             context_terms=context_terms,
         )
@@ -1037,12 +1362,19 @@ def main() -> int:
             pass
 
     stats = {
+        "profile": profile_name or "general",
+        "profile_label": profile.get("label") or "通用学科",
         "core_terms": core_terms,
         "focus_terms": focus_terms,
         "context_terms": context_terms,
         "broad_terms": broad_terms,
         "categories": categories,
+        "mesh_terms": mesh_terms,
+        "sources": sorted(sources),
         "query_expression": oa_expression(core_terms),
+        "pubmed_expression": pubmed_term(
+            core_terms, focus_terms, mesh_terms, year_from, year_to)
+        if "pubmed" in sources else "",
         "focus_expression": oa_focus_expression(
             focus_terms, [t for t in core_terms if t not in focus_terms]),
         "year_from": year_from,
@@ -1056,13 +1388,14 @@ def main() -> int:
         "current_year_count": current_year_count,
         "year_range": [min(years), max(years)] if years else None,
         "newest_date": newest_date,
-        "recent_days": int(args.recent_days or spec.get("recent_days") or RECENT_DAYS),
+        "recent_days": recent_days,
         "warnings": warnings,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
     stats_path = out_path.with_suffix(".stats.json")
     stats_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    print(f"学科模板: {profile_name or 'general'}  数据源: {sorted(sources)}")
     print(f"记录数: {len(records)}  来源: {by_source}  综述/教程: {reviews}")
     print(f"主题中心度: {scope_counts}")
     print(f"当年论文: {current_year_count}  近 12 个月: {recent_priority_count}")
