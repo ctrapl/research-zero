@@ -1,0 +1,16 @@
+{
+  "name": "general",
+  "label": "通用学科",
+  "sources": "openalex,arxiv",
+  "default_categories": [],
+  "default_mesh": [],
+  "max_refs": 25,
+  "recent_days": 183,
+  "foundational_age": 5,
+  "top_venues": [],
+  "evidence_weights": {},
+  "review_prefer": ["survey", "review", "tutorial"],
+  "coverage_note": "覆盖 OpenAlex 收录的英文文献与 arXiv 预印本；不覆盖 CNKI / 万方等中文库，中文综述需自行补充。",
+  "search_note": "通用检索：三段式关键词（对象 AND 方法 AND 场景）+ 同义词簇。",
+  "report_sections": []
+}
